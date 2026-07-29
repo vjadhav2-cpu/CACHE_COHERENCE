@@ -425,16 +425,26 @@ module l1_tilelink_adapter (
                 
                 STATE_UNCACHED_RSP_WAIT: begin
                     // Wait for AccessAck/AccessAckData on Channel D
-                    if (d_valid && (d_opcode == D_OPCODE_ACCESS_ACK || d_opcode == D_OPCODE_ACCESS_ACK_DATA) && 
+                    if (d_valid && (d_opcode == D_OPCODE_ACCESS_ACK || d_opcode == D_OPCODE_ACCESS_ACK_DATA) &&
                         d_source == pending_source_id) begin
-                        
-                        // If this was a read (AccessAckData), forward the data to the L1 cache
+
+                        // Pulse completion for both writes (AccessAck) and reads
+                        // (AccessAckData). Without this, an uncached write has no
+                        // externally observable completion signal at all: this
+                        // module's own l1_request_ready does not reassert on its
+                        // own once idle (it needs a fresh l1_request_valid to
+                        // regrant a source ID first), so a caller polling it as
+                        // a "write done" pulse deadlocks. Only reads forwarded
+                        // real data before this fix; writes now pulse with
+                        // data_to_l1_data driven to zero.
+                        data_to_l1_valid <= 1'b1;
                         if (d_opcode == D_OPCODE_ACCESS_ACK_DATA) begin
-                            data_to_l1_valid <= 1'b1;
                             data_to_l1_data <= {{(256-64){1'b0}}, d_data};  // Pad the data to cache line width
-                            data_to_l1_error <= d_error;
+                        end else begin
+                            data_to_l1_data <= 256'b0;
                         end
-                        
+                        data_to_l1_error <= d_error;
+
                         // Prepare for source ID deallocation
                         dealloc_source_id <= d_source;
                     end

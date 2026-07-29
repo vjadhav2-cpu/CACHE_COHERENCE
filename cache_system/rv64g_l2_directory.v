@@ -95,7 +95,7 @@ module rv64g_l2_directory #(
         if (!rst_n) begin
             // Asynchronous active-low reset - consistent with rest of design
             for (i = 0; i < SETS; i = i + 1) begin
-                ram[i] <= {(WAYS*ENTRY_W){1'b0}};
+                ram[i] = {(WAYS*ENTRY_W){1'b0}};
             end
         end else if (we_i) begin
             ram[wr_set_i][wr_way_i*ENTRY_W +: ENTRY_W] <= wr_entry_packed;

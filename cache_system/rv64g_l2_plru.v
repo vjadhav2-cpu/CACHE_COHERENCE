@@ -32,7 +32,7 @@ module rv64g_l2_plru (
 	always @(posedge clk_i or negedge rst_ni) begin
 		if (!rst_ni) begin
 			for (si = 0; si < NUM_SETS; si = si + 1) begin
-				plru_bits_q[si] <= 15'b0;
+				plru_bits_q[si] = 15'b0;
 			end
 		end else if (access_i) begin
 			// Update bits along the path to the accessed way to point to the sibling (make sibling LRU)
