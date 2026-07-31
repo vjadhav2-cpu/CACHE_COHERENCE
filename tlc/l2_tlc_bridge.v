@@ -3,36 +3,43 @@
 
 // Bridges rv64g_l2_cache.v's memory-side TL-UH port (mem_a_*_o / mem_d_*_i,
 // see cache_system/rv64g_l2_cache.v:58-78) onto one l1_tilelink_adapter
-// instance's uncached Get/Put path (STATE_UNCACHED_REQ_SEND ->
-// STATE_UNCACHED_RSP_WAIT) -- the same adapter path tlc/dma_tlc_bridge.v
-// was written against for the DMA's uncached mem_* traffic.
+// instance. The original implementation used only the adapter's uncached
+// Get/Put path. This file is now the first step toward a coherent L2/TLC
+// integration:
+//   - refill reads are issued as coherent read misses so the TLC-side
+//     directory can start tracking L2 presence
+//   - probe requests are surfaced and explicitly flagged as needing a real
+//     snoop hook into L2, instead of being silently tied off
 //
-// Why this can't be a straight port hookup (see
+// This file alone cannot complete the full coherency fix. A correct probe
+// response still requires a new snoop/invalidate path into rv64g_l2_cache /
+// rv64g_l2_fsm.v, which is intentionally left as follow-up work rather than
+// being faked here.
+//
+// Why this still cannot be a straight port hookup (see
 // docs/l2_tlc_xbar_integration_plan.md for the full writeup):
 // L2 does real 8-beat, 64-byte-line bursts on its mem port -- one Get
 // covering all 8 read words, or one PutFullData streaming all 8 write
 // words (rv64g_l2_fsm.v ST_MEM_READ / ST_MEM_WRITE) -- but
-// l1_tilelink_adapter.v's uncached path only ever moves a single 64-bit
-// beat per transaction ("Only first beat for now",
-// l1_tilelink_adapter.v:411). This bridge decomposes each L2 line access
-// into 8 sequential single-beat Get/PutFullData round trips through that
-// adapter, one 8-byte word at a time, and reassembles the D-channel side
-// back into the 8-beat handshake rv64g_l2_fsm.v expects. This is the
-// documented v1 simplification (Option A); a burst-capable adapter
-// (Option B) is tracked separately.
+// l1_tilelink_adapter.v only ever moves one 64-bit beat per request.
+// This bridge therefore keeps the documented v1 simplification: decompose
+// each L2 line access into 8 sequential single-beat requests through the
+// adapter, then reassemble the D-channel side back into the 8-beat handshake
+// rv64g_l2_fsm.v expects.
 //
-// Probe safety: like dma_tlc_bridge.v, this bridge never issues Acquire,
-// only Get/PutFullData. Verified against tlc_slave_mem_manager.v: its
-// S_D_SEND state clears dir_v/dir_pres for req_is_put/req_is_get instead
-// of recording ownership (only AcquireBlock/AcquirePerm register a
-// requester in dir_pres). So this port is never a legitimate probe
-// target and drives no probe_ack_from_l1_* response.
+// Transitional limitations:
+//   - reads now use the coherent Acquire/Grant path
+//   - writes still use the uncached Put/AccessAck path for now, because the
+//     current l1_tilelink_adapter.v interface does not expose a bridge-visible
+//     completion pulse for ReleaseAck
+//   - incoming probes can now be observed here, but they cannot yet trigger a
+//     real invalidate/writeback inside L2 without additional cache_system/ RTL
 //
 // Depends on a fix to l1_tilelink_adapter.v's STATE_UNCACHED_RSP_WAIT:
 // originally only AccessAckData (read) pulsed data_to_l1_valid, leaving
-// uncached writes with no observable completion signal at all (confirmed
-// by simulation, not just inspection -- see commit history). Plain
-// AccessAck now pulses it too, with data_to_l1_data driven to zero.
+// uncached writes with no observable completion signal at all (confirmed by
+// simulation, not just inspection -- see commit history). Plain AccessAck now
+// pulses it too, with data_to_l1_data driven to zero.
 module l2_tlc_bridge #(
     parameter ADDR_W = 64,
     parameter DATA_W = 64
@@ -52,6 +59,18 @@ module l2_tlc_bridge #(
     output wire                  mem_d_valid_o,
     input  wire                  mem_d_ready_i,
 
+    // Snoop handshake into rv64g_l2_cache.v / rv64g_l2_fsm.v.
+    output reg                   snoop_req_valid_o,
+    output reg  [ADDR_W-1:0]     snoop_req_addr_o,
+    output reg  [2:0]            snoop_req_permissions_o,
+    input  wire                  snoop_req_ready_i,
+
+    input  wire                  snoop_rsp_valid_i,
+    input  wire                  snoop_rsp_has_data_i,
+    input  wire [DATA_W-1:0]     snoop_rsp_data_i,
+    input  wire [2:0]            snoop_rsp_permissions_i,
+    output wire                  snoop_rsp_ready_o,
+
     // l1_tilelink_adapter.v L1-facing interface -- same port shape as
     // tlc_xbar_fabric_top.v's mX_req_*/mX_data_* master port, so this
     // bridge drops onto any free master slot (e.g. m0) unchanged.
@@ -66,27 +85,22 @@ module l2_tlc_bridge #(
     input  wire [255:0]           data_to_l1_data,
     input  wire                   data_to_l1_error,
 
-    // Never a legitimate probe target (see header) -- tied off.
+    // Probe side-band from tlc_xbar_fabric_top / l1_tilelink_adapter.
     input  wire                   probe_req_to_l1_valid,
     input  wire [31:0]            probe_req_to_l1_addr,
     input  wire [2:0]             probe_req_to_l1_permissions,
 
-    output wire                   probe_ack_from_l1_valid,
-    output wire [31:0]            probe_ack_from_l1_addr,
-    output wire [2:0]             probe_ack_from_l1_permissions,
-    output wire [255:0]           probe_ack_from_l1_dirty_data
+    output reg                    probe_ack_from_l1_valid,
+    output reg  [31:0]            probe_ack_from_l1_addr,
+    output reg  [2:0]             probe_ack_from_l1_permissions,
+    output reg  [255:0]           probe_ack_from_l1_dirty_data
 );
 
     `include "tlc64b2M_params.v"
 
-    assign probe_ack_from_l1_valid       = 1'b0;
-    assign probe_ack_from_l1_addr        = 32'b0;
-    assign probe_ack_from_l1_permissions = PARAM_NtoN;
-    assign probe_ack_from_l1_dirty_data  = 256'b0;
-
     localparam [2:0] S_ACCEPT = 3'd0,  // mem_a_ready_o high; take one beat from L2
                      S_L1_REQ = 3'd1,  // drive l1_request_* until l1_request_ready
-                     S_L1_RESP= 3'd2,  // wait for this beat's uncached completion
+                     S_L1_RESP= 3'd2,  // wait for this beat's adapter completion
                      S_D_BEAT = 3'd3;  // hand a D-channel beat back to L2
 
     reg [2:0] state;
@@ -95,6 +109,11 @@ module l2_tlc_bridge #(
     reg [ADDR_W-1:0] base_addr;
     reg [DATA_W-1:0] cur_wdata;
     reg [DATA_W-1:0] cur_rdata;
+
+    reg [31:0] probe_addr_q;
+    reg       probe_req_accepted_q;
+    reg       probe_waiting_rsp_q;
+    reg       probe_ack_pending_q;
 
     assign mem_a_ready_o = (state == S_ACCEPT);
 
@@ -115,6 +134,7 @@ module l2_tlc_bridge #(
     assign mem_d_data_o   = is_write ? {DATA_W{1'b0}} : cur_rdata;
 
     wire [31:0] beat_addr = base_addr[31:0] + {26'b0, beat_cnt, 3'b0};
+    assign snoop_rsp_ready_o = probe_waiting_rsp_q;
 
 `ifndef SYNTHESIS
     always @(posedge clk) begin
@@ -122,25 +142,76 @@ module l2_tlc_bridge #(
             mem_a_address_i[ADDR_W-1:32] != {(ADDR_W-32){1'b0}}) begin
             $error("[L2_BRIDGE_ASSERT] mem_a_address_i upper bits nonzero -- 32-bit l1_request_addr would silently truncate 0x%016h", mem_a_address_i);
         end
+
     end
 `endif
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state                   <= S_ACCEPT;
-            beat_cnt                <= 3'd0;
-            is_write                <= 1'b0;
-            base_addr               <= {ADDR_W{1'b0}};
-            cur_wdata               <= {DATA_W{1'b0}};
-            cur_rdata               <= {DATA_W{1'b0}};
+            state                         <= S_ACCEPT;
+            beat_cnt                      <= 3'd0;
+            is_write                      <= 1'b0;
+            base_addr                     <= {ADDR_W{1'b0}};
+            cur_wdata                     <= {DATA_W{1'b0}};
+            cur_rdata                     <= {DATA_W{1'b0}};
+            probe_addr_q                  <= 32'b0;
+            probe_req_accepted_q          <= 1'b0;
+            probe_waiting_rsp_q           <= 1'b0;
+            probe_ack_pending_q           <= 1'b0;
 
-            l1_request_valid        <= 1'b0;
-            l1_request_addr         <= 32'b0;
-            l1_request_type         <= 3'b0;
-            l1_request_data         <= 256'b0;
-            l1_request_permissions  <= 3'b0;
+            l1_request_valid              <= 1'b0;
+            l1_request_addr               <= 32'b0;
+            l1_request_type               <= 3'b0;
+            l1_request_data               <= 256'b0;
+            l1_request_permissions        <= 3'b0;
+
+            probe_ack_from_l1_valid       <= 1'b0;
+            probe_ack_from_l1_addr        <= 32'b0;
+            probe_ack_from_l1_permissions <= PARAM_NtoN;
+            probe_ack_from_l1_dirty_data  <= 256'b0;
+            snoop_req_valid_o             <= 1'b0;
+            snoop_req_addr_o              <= {ADDR_W{1'b0}};
+            snoop_req_permissions_o       <= PARAM_NtoN;
         end else begin
             l1_request_valid <= 1'b0;
+            probe_ack_from_l1_valid <= probe_ack_pending_q;
+            snoop_req_valid_o <= snoop_req_valid_o;
+            snoop_req_addr_o <= snoop_req_addr_o;
+            snoop_req_permissions_o <= snoop_req_permissions_o;
+
+            if (probe_ack_pending_q && !probe_req_to_l1_valid) begin
+                probe_ack_pending_q <= 1'b0;
+                probe_ack_from_l1_valid <= 1'b0;
+            end
+
+            if (probe_req_to_l1_valid && !probe_req_accepted_q && !probe_waiting_rsp_q) begin
+                snoop_req_valid_o       <= 1'b1;
+                snoop_req_addr_o        <= {{(ADDR_W-32){1'b0}}, probe_req_to_l1_addr};
+                snoop_req_permissions_o <= probe_req_to_l1_permissions;
+                probe_addr_q            <= probe_req_to_l1_addr;
+                if (snoop_req_ready_i) begin
+                    probe_req_accepted_q <= 1'b1;
+                    probe_waiting_rsp_q  <= 1'b1;
+                    snoop_req_valid_o    <= 1'b0;
+                end
+            end else if (snoop_req_valid_o && snoop_req_ready_i) begin
+                probe_req_accepted_q <= 1'b1;
+                probe_waiting_rsp_q  <= 1'b1;
+                snoop_req_valid_o    <= 1'b0;
+            end
+
+            if (!probe_req_to_l1_valid && !probe_waiting_rsp_q) begin
+                probe_req_accepted_q <= 1'b0;
+            end
+
+            if (probe_waiting_rsp_q && snoop_rsp_valid_i) begin
+                probe_ack_pending_q           <= 1'b1;
+                probe_ack_from_l1_valid       <= 1'b1;
+                probe_ack_from_l1_addr        <= probe_addr_q;
+                probe_ack_from_l1_permissions <= snoop_rsp_permissions_i;
+                probe_ack_from_l1_dirty_data  <= snoop_rsp_has_data_i ? {{(256-DATA_W){1'b0}}, snoop_rsp_data_i} : 256'b0;
+                probe_waiting_rsp_q           <= 1'b0;
+            end
 
             case (state)
                 S_ACCEPT: begin
@@ -156,20 +227,19 @@ module l2_tlc_bridge #(
 
                 S_L1_REQ: begin
                     l1_request_valid       <= 1'b1;
-                    l1_request_type        <= is_write ? L1_REQ_UNCACHED_WRITE : L1_REQ_UNCACHED_READ;
+                    l1_request_type        <= is_write ? L1_REQ_UNCACHED_WRITE : L1_REQ_READ_MISS;
                     l1_request_addr        <= (beat_cnt == 3'd0) ? base_addr[31:0] : beat_addr;
                     l1_request_data        <= {{(256-DATA_W){1'b0}}, cur_wdata};
-                    l1_request_permissions <= 3'b0;
+                    l1_request_permissions <= is_write ? 3'b0 : PARAM_NtoB;
                     if (l1_request_ready) begin
                         l1_request_valid <= 1'b0;
                         state            <= S_L1_RESP;
                     end
                 end
 
-                // data_to_l1_valid pulses on both AccessAck (write) and
-                // AccessAckData (read) -- see l1_tilelink_adapter.v's
-                // STATE_UNCACHED_RSP_WAIT. Writes carry no data (bridge
-                // ignores data_to_l1_data for writes).
+                // For writes we still rely on the uncached AccessAck pulse.
+                // For reads the coherent path returns GrantData, which the
+                // adapter also reflects as data_to_l1_valid/data_to_l1_data.
                 S_L1_RESP: begin
                     if (data_to_l1_valid) begin
                         if (is_write) begin

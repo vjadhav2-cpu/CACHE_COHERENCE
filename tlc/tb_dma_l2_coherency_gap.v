@@ -87,6 +87,7 @@ module tb_dma_l2_coherency_gap;
     reg [63:0] source_words [0:TOTAL_WORDS-1]; // peripheral-side data DMA writes into memory
     reg [63:0] sink_words   [0:TOTAL_WORDS-1]; // peripheral-side data DMA reads back out
     reg        sink_seen    [0:TOTAL_WORDS-1];
+    reg        l1_has_copy;
     integer errors;
     integer i;
 
@@ -224,6 +225,48 @@ module tb_dma_l2_coherency_gap;
         end
     end
 
+    // Minimal L1-side probe responder for this coherency test.
+    // The testbench only ever holds a clean shared copy after STEP 1, so it
+    // can answer Probe requests with ProbeAck (no data):
+    //   - toB => BtoB (keep shared copy)
+    //   - toN => BtoN (invalidate shared copy)
+    always @(negedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            l2_tl_c_opcode  <= 3'b0;
+            l2_tl_c_param   <= 3'b0;
+            l2_tl_c_source  <= 6'b0;
+            l2_tl_c_address <= 64'b0;
+            l2_tl_c_data    <= 64'b0;
+            l2_tl_c_valid   <= 1'b0;
+            l1_has_copy     <= 1'b0;
+        end else begin
+            if (l2_tl_c_valid && l2_tl_c_ready) begin
+                l2_tl_c_valid <= 1'b0;
+            end
+
+            if (!l2_tl_c_valid && l2_tl_b_valid && l2_tl_b_ready) begin
+                l2_tl_c_opcode  <= 3'd4; // C_PROBE_ACK
+                l2_tl_c_source  <= 6'd0; // core 0 in upper CID bits
+                l2_tl_c_address <= l2_tl_b_address;
+                l2_tl_c_data    <= 64'd0;
+                if (!l1_has_copy) begin
+                    l2_tl_c_param <= 3'd5; // NtoN
+                end else if (l2_tl_b_param == 3'd0) begin
+                    l2_tl_c_param <= 3'd4; // BtoB
+                end else begin
+                    l2_tl_c_param <= 3'd2; // BtoN
+                    l1_has_copy   <= 1'b0;
+                end
+                l2_tl_c_valid <= 1'b1;
+                $display("[TB_PROBE_ACK][%0t] addr=0x%016h b_param=%0d c_param=%0d has_copy=%0d",
+                         $time, l2_tl_b_address, l2_tl_b_param,
+                         (!l1_has_copy) ? 3'd5 : ((l2_tl_b_param == 3'd0) ? 3'd4 : 3'd2),
+                         l1_has_copy);
+            end
+        end
+    end
+
+
     // Acquire address TEST_ADDR with param NtoB (shared read), capture the
     // NUM_BEATS GrantData beats into `capture`, then send GrantAck.
     task automatic l2_acquire_and_capture(output [63:0] capture [0:NUM_BEATS-1]);
@@ -254,6 +297,7 @@ module tb_dma_l2_coherency_gap;
             l2_tl_e_sink  = 2'd0;
             settle();
             l2_tl_e_valid = 1'b0;
+            l1_has_copy   = 1'b1;
         end
     endtask
 
@@ -277,6 +321,7 @@ module tb_dma_l2_coherency_gap;
         l2_tl_c_address     = 64'b0;
         l2_tl_c_data        = 64'b0;
         l2_tl_c_valid       = 1'b0;
+        l1_has_copy         = 1'b0;
         l2_tl_d_ready       = 1'b0;
         l2_tl_e_valid       = 1'b0;
         l2_tl_e_sink        = 2'b0;
@@ -360,6 +405,11 @@ module tb_dma_l2_coherency_gap;
         hazard_mismatches   = 0;
         stale_confirmations = 0;
         for (i = 0; i < NUM_BEATS; i = i + 1) begin
+            if (l2_data_after_dma[i] !== source_words[i]) begin
+                $display("[%0t] ERROR: STEP 4 stale/mismatched beat %0d exp=0x%016h got=0x%016h",
+                         $time, i, source_words[i], l2_data_after_dma[i]);
+                errors = errors + 1;
+            end
             if (l2_data_after_dma[i] !== l2_data_before_dma[i]) begin
                 hazard_mismatches = hazard_mismatches + 1;
             end
@@ -369,32 +419,24 @@ module tb_dma_l2_coherency_gap;
             end
         end
 
-        if (slv0_total_rd_count !== rd_count_before_reacquire) begin
-            $display("[%0t] UNEXPECTED: re-Acquire triggered %0d new memory reads -- this would mean L2 did NOT serve from its own cache",
-                      $time, slv0_total_rd_count - rd_count_before_reacquire);
+        if (slv0_total_rd_count <= rd_count_before_reacquire) begin
+            $display("[%0t] ERROR: STEP 4 did not trigger a refetch (rd_count_before=%0d rd_count_after=%0d)",
+                     $time, rd_count_before_reacquire, slv0_total_rd_count);
             errors = errors + 1;
         end
 
-        if (stale_confirmations == NUM_BEATS && hazard_mismatches == 0) begin
-            $display("\n[%0t] HAZARD CONFIRMED (expected on current architecture):", $time);
-            $display("  L2 served all %0d beats from its own cache, identical to the pre-DMA values,", NUM_BEATS);
-            $display("  even though memory itself now holds the DMA's new data (confirmed in STEP 3).");
-            $display("  slv0_total_rd_count did not increase (%0d) -- L2 never re-touched memory.", slv0_total_rd_count);
-            $display("  This is the coherency gap docs/l2_tlc_xbar_integration_plan.md flags: DMA writes");
-            $display("  are invisible to rv64g_l2_directory.v, so no probe/invalidate ever fires.");
-        end else begin
-            $display("\n[%0t] UNEXPECTED: hazard NOT reproduced as predicted (mismatches=%0d, stale_confirmations=%0d/%0d) --",
-                      $time, hazard_mismatches, stale_confirmations, NUM_BEATS);
-            $display("  either something already provides coherency here, or this characterization test's");
-            $display("  assumptions about the current architecture are wrong. Investigate before trusting it");
-            $display("  as a baseline for testing a fix.");
-            errors = errors + 1;
+        if (errors == 0) begin
+            $display("\n[%0t] COHERENCY FIX CONFIRMED:", $time);
+            $display("  DMA updated memory while L2 had the line cached.");
+            $display("  L2 probed its upper-level holder, accepted the ProbeAck, and invalidated/downgraded state.");
+            $display("  The next L2 acquire re-fetched from memory and returned the DMA-written data.");
+            $display("  slv0_total_rd_count increased from %0d to %0d.", rd_count_before_reacquire, slv0_total_rd_count);
         end
 
         if (errors != 0) begin
             $display("\nTEST FAILED with %0d errors", errors);
         end else begin
-            $display("\nTEST PASSED (hazard successfully characterized)");
+            $display("\nTEST PASSED (coherency fix validated)");
         end
         $finish;
     end

@@ -428,7 +428,17 @@ module rv64g_cache_system #(
         .mem_d_data_i(mem_d_data_i),
         .mem_d_corrupt_i(mem_d_corrupt_i),
         .mem_d_valid_i(mem_d_valid_i),
-        .mem_d_ready_o(mem_d_ready_o)
+        .mem_d_ready_o(mem_d_ready_o),
+
+        .snoop_req_valid_i(1'b0),
+        .snoop_req_addr_i(64'b0),
+        .snoop_req_permissions_i(3'b0),
+        .snoop_req_ready_o(),
+        .snoop_rsp_valid_o(),
+        .snoop_rsp_has_data_o(),
+        .snoop_rsp_data_o(),
+        .snoop_rsp_permissions_o(),
+        .snoop_rsp_ready_i(1'b0)
     );
 
 endmodule

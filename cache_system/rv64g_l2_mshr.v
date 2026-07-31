@@ -70,7 +70,9 @@ module rv64g_l2_mshr #(
                 pending_probes_q <= {CORES{1'b0}}; // Initially 0, FSM sets it later
             end else begin
                 // Probe Management
-                if (set_probes_i) begin
+                if (set_probes_i && probe_ack_i) begin
+                    pending_probes_q <= probes_mask_i & ~( {{(CORES-1){1'b0}}, 1'b1} << probe_ack_id_i );
+                end else if (set_probes_i) begin
                     pending_probes_q <= probes_mask_i;
                 end else if (probe_ack_i) begin
                     pending_probes_q[probe_ack_id_i] <= 1'b0;

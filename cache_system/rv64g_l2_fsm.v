@@ -77,6 +77,18 @@ module rv64g_l2_fsm #(
     input  wire         mem_d_valid_i,
     output reg          mem_d_ready_o,
 
+    // External snoop handshake from the TLC-facing bridge.
+    input  wire         snoop_req_valid_i,
+    input  wire [63:0]  snoop_req_addr_i,
+    input  wire [2:0]   snoop_req_permissions_i,
+    output reg          snoop_req_ready_o,
+
+    output reg          snoop_rsp_valid_o,
+    output reg          snoop_rsp_has_data_o,
+    output reg  [63:0]  snoop_rsp_data_o,
+    output reg  [2:0]   snoop_rsp_permissions_o,
+    input  wire         snoop_rsp_ready_i,
+
     // Directory Read Interface
     output reg  [7:0]   dir_rd_set_o,
     input  wire [WAYS-1:0]          dir_rd_valid_i,
@@ -134,6 +146,7 @@ module rv64g_l2_fsm #(
     localparam ST_MEM_RESP   = 4'd10; // Wait for Writeback Ack
     localparam ST_REL_DATA   = 4'd11; // Receive ReleaseData beats
     localparam ST_WAIT_E     = 4'd12; // Wait for GrantAck
+    localparam ST_SNOOP_RSP  = 4'd13; // Return snoop response to bridge
 
 reg [3:0] next_state, state_q;
     reg [2:0] burst_cnt; // Burst Counter for Memory Access
@@ -169,6 +182,9 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
     reg [3:0] latched_hit_way;
     reg       latched_hit;
     reg       processing_release; // Flag to indicate we are handling a Release
+    reg       processing_snoop;
+    reg       snoop_rsp_has_data_q;
+    reg [2:0] snoop_rsp_permissions_q;
 
     // Tag Comparison
     integer w;
@@ -261,9 +277,17 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
     // Calculate who to probe
     // If AcquireBlock (Read): Probe Owner (to get data/downgrade)
     // If AcquirePerm (Write): Probe Sharers + Owner (to invalidate)
+    // If an external snoop arrives from below L2: probe every upper-level holder.
     always @* begin
         probes_to_send = {CORES{1'b0}};
-        if (hit) begin
+        if (processing_snoop) begin
+            if (hit) begin
+                probes_to_send = hit_sharers;
+                if (hit_owner_valid) begin
+                    probes_to_send[hit_owner_id] = 1'b1;
+                end
+            end
+        end else if (hit) begin
             if (req_opcode_q == 3'd6) begin // AcquireBlock
                 if (req_param_q == 3'd0) begin // NtoB (Read Shared)
                     // If owned, probe owner (to downgrade/flush)
@@ -400,6 +424,12 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
         plru_access = 1'b0;
         plru_used_way = 4'd0;
 
+        snoop_req_ready_o = 1'b0;
+        snoop_rsp_valid_o = 1'b0;
+        snoop_rsp_has_data_o = 1'b0;
+        snoop_rsp_data_o = 64'd0;
+        snoop_rsp_permissions_o = NtoN;
+
         // Memory Interface Defaults
         mem_a_opcode_o = 3'd0;
         mem_a_param_o = 3'd0;
@@ -419,7 +449,8 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                 probe_ack_id = c_core_id;
                 mshr_probe_ack_id_o = probe_ack_id;
 
-                if (mshr_pending_probes_i[probe_ack_id]) begin
+                if (mshr_pending_probes_i[probe_ack_id] ||
+                    (state_q == ST_CHECK && probes_to_send[probe_ack_id])) begin
                     if (c_opcode_i == C_PROBE_ACK_DATA) begin
                         // Write Data
                         data_we_o = 1'b1;
@@ -484,6 +515,11 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                     rel_buf_data_n = c_data_i;
                     rel_data_cnt_n = 3'd0;
                     rel_drop_n = 1'b0;
+                end else if (snoop_req_valid_i) begin
+                    snoop_req_ready_o = 1'b1;
+                    if (snoop_req_ready_o) begin
+                        next_state = ST_RAM_WAIT;
+                    end
                 end else begin
                     a_ready_o = !mshr_busy_i;
                     if (a_valid_i && !mshr_busy_i) begin
@@ -514,8 +550,32 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                             next_state = ST_REL_DATA;
                             rel_drop_n = 1'b1;
                         end else begin
-                            next_state = ST_GRANT; 
+                            next_state = ST_GRANT;
                         end
+                    end
+                end else if (processing_snoop) begin
+                    if (hit && probes_to_send != 0) begin
+                        if (probes_sent_q == 0) begin
+                            mshr_set_probes_o = probes_to_send;
+                        end
+
+                        if (probe_needed) begin
+                            b_valid_o = 1'b1;
+                            b_dest_o = next_probe_target;
+                            b_address_o = req_addr_q;
+                            b_opcode_o = 3'd6; // B_PROBE
+                            b_param_o = req_param_q;
+                        end
+
+                        if (b_valid_o && b_ready_i) begin
+                            if (probes_to_send == (probes_sent_q | (1 << next_probe_target))) begin
+                                next_state = ST_WAIT_ACK;
+                            end
+                        end
+                    end else if (hit) begin
+                        next_state = ST_UPDATE;
+                    end else begin
+                        next_state = ST_SNOOP_RSP;
                     end
                 end else begin
                     // Acquire Handling
@@ -565,7 +625,7 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
 
             ST_WAIT_ACK: begin
                 if (mshr_pending_probes_i == 0) begin
-                    next_state = ST_GRANT;
+                    next_state = processing_snoop ? ST_UPDATE : ST_GRANT;
                 end
             end
 
@@ -736,6 +796,24 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                     end
                     
                     next_state = ST_GRANT; // Send Ack after Update
+                end else if (processing_snoop) begin
+                    if (req_param_q == 3'd0) begin
+                        dir_wr_valid_o = 1'b1;
+                        dir_wr_sharers_o = hit_sharers;
+                        if (hit_owner_valid) begin
+                            dir_wr_sharers_o = hit_sharers | ({{(CORES-1){1'b0}},1'b1} << hit_owner_id);
+                        end
+                        dir_wr_owner_valid_o = 1'b0;
+                        dir_wr_owner_id_o = {CID_W{1'b0}};
+                        dir_wr_dirty_o = 1'b0;
+                    end else begin
+                        dir_wr_valid_o = 1'b0;
+                        dir_wr_sharers_o = {CORES{1'b0}};
+                        dir_wr_owner_valid_o = 1'b0;
+                        dir_wr_owner_id_o = {CID_W{1'b0}};
+                        dir_wr_dirty_o = 1'b0;
+                    end
+                    next_state = ST_SNOOP_RSP;
                 end else begin
                     // Acquire (Existing Logic)
                     if (req_opcode_q == 3'd6) begin // AcquireBlock
@@ -776,8 +854,22 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                 end
             end
 
+            ST_SNOOP_RSP: begin
+                snoop_rsp_valid_o = 1'b1;
+                snoop_rsp_has_data_o = snoop_rsp_has_data_q;
+                snoop_rsp_permissions_o = snoop_rsp_permissions_q;
+                data_set_o = req_addr_q[13:6];
+                data_way_o = latched_hit_way;
+                tag_way_o = latched_hit_way;
+                data_word_sel_o = 3'd0;
+                snoop_rsp_data_o = data_rdata_i;
+                if (snoop_rsp_ready_i) begin
+                    next_state = ST_COMPLETE;
+                end
+            end
+
             ST_COMPLETE: begin
-                mshr_dealloc_o = 1'b1;
+                mshr_dealloc_o = !processing_snoop;
                 next_state = ST_IDLE;
             end
             default: begin
@@ -805,6 +897,9 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
             rel_buf_data_q <= 64'd0;
             rel_drop_q <= 1'b0;
             processing_release <= 1'b0;
+            processing_snoop <= 1'b0;
+            snoop_rsp_has_data_q <= 1'b0;
+            snoop_rsp_permissions_q <= NtoN;
         end else begin
             state_q <= next_state;
             e_seen_q <= e_seen_n;
@@ -813,6 +908,20 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
             rel_buf_valid_q <= rel_buf_valid_n;
             rel_buf_data_q <= rel_buf_data_n;
             rel_drop_q <= rel_drop_n;
+
+            if (state_q == ST_CHECK && processing_snoop) begin
+                if (hit) begin
+                    snoop_rsp_has_data_q <= hit_dirty || hit_owner_valid;
+                    if (req_param_q == 3'd0) begin
+                        snoop_rsp_permissions_q <= hit_owner_valid ? TtoB : BtoB;
+                    end else begin
+                        snoop_rsp_permissions_q <= hit_owner_valid ? TtoN : BtoN;
+                    end
+                end else begin
+                    snoop_rsp_has_data_q <= 1'b0;
+                    snoop_rsp_permissions_q <= NtoN;
+                end
+            end
 
             // Probe Data Counter Logic
             if (c_valid_i && c_ready_o && c_opcode_i == C_PROBE_ACK_DATA &&
@@ -853,6 +962,16 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                     req_param_q <= c_param_i;
                     req_source_q <= c_source_i;
                     processing_release <= 1'b1;
+                    processing_snoop <= 1'b0;
+                    e_seen_q <= 1'b0;
+                end else if (snoop_req_valid_i && snoop_req_ready_o) begin
+                    req_addr_q <= snoop_req_addr_i;
+                    req_data_q <= 64'd0;
+                    req_opcode_q <= B_PROBE;
+                    req_param_q <= snoop_req_permissions_i;
+                    req_source_q <= {SOURCE_W{1'b0}};
+                    processing_release <= 1'b0;
+                    processing_snoop <= 1'b1;
                     e_seen_q <= 1'b0;
                 end else if (a_valid_i && a_ready_o) begin
                     req_addr_q <= a_address_i;
@@ -860,6 +979,7 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                     req_param_q <= a_param_i;
                     req_source_q <= a_source_i;
                     processing_release <= 1'b0;
+                    processing_snoop <= 1'b0;
                     e_seen_q <= 1'b0;
                 end
             end
@@ -869,6 +989,10 @@ wire [CID_W-1:0] c_core_id = c_source_i[SOURCE_W-1 -: CID_W];
                 probes_sent_q <= {CORES{1'b0}};
             end else if (state_q == ST_CHECK && b_valid_o && b_ready_i) begin
                  probes_sent_q[next_probe_target] <= 1'b1;
+            end
+
+            if (state_q == ST_COMPLETE) begin
+                processing_snoop <= 1'b0;
             end
         end
     end

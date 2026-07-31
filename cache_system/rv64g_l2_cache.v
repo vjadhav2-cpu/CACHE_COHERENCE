@@ -75,7 +75,19 @@ module rv64g_l2_cache #(
     input  wire [DATA_W-1:0]  mem_d_data_i,
     input  wire         mem_d_corrupt_i,
     input  wire         mem_d_valid_i,
-    output wire         mem_d_ready_o
+    output wire         mem_d_ready_o,
+
+    // External snoop handshake from the TLC-facing bridge.
+    input  wire         snoop_req_valid_i,
+    input  wire [ADDR_W-1:0] snoop_req_addr_i,
+    input  wire [2:0]   snoop_req_permissions_i,
+    output wire         snoop_req_ready_o,
+
+    output wire         snoop_rsp_valid_o,
+    output wire         snoop_rsp_has_data_o,
+    output wire [DATA_W-1:0] snoop_rsp_data_o,
+    output wire [2:0]   snoop_rsp_permissions_o,
+    input  wire         snoop_rsp_ready_i
 );
 
     // Internal Signals
@@ -201,6 +213,16 @@ module rv64g_l2_cache #(
         .mem_d_corrupt_i(mem_d_corrupt_i),
         .mem_d_valid_i(mem_d_valid_i),
         .mem_d_ready_o(mem_d_ready_o),
+
+        .snoop_req_valid_i(snoop_req_valid_i),
+        .snoop_req_addr_i(snoop_req_addr_i),
+        .snoop_req_permissions_i(snoop_req_permissions_i),
+        .snoop_req_ready_o(snoop_req_ready_o),
+        .snoop_rsp_valid_o(snoop_rsp_valid_o),
+        .snoop_rsp_has_data_o(snoop_rsp_has_data_o),
+        .snoop_rsp_data_o(snoop_rsp_data_o),
+        .snoop_rsp_permissions_o(snoop_rsp_permissions_o),
+        .snoop_rsp_ready_i(snoop_rsp_ready_i),
 
         // Directory Interface
         .dir_rd_set_o(dir_rd_set),

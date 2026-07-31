@@ -156,6 +156,16 @@ module tlc_l2_dma_shared_mem_top #(
     wire               l2_mem_d_valid;
     wire               l2_mem_d_ready;
 
+    wire               l2_snoop_req_valid;
+    wire [L2_ADDR_W-1:0] l2_snoop_req_addr;
+    wire [2:0]         l2_snoop_req_permissions;
+    wire               l2_snoop_req_ready;
+    wire               l2_snoop_rsp_valid;
+    wire               l2_snoop_rsp_has_data;
+    wire [DATA_W-1:0]  l2_snoop_rsp_data;
+    wire [2:0]         l2_snoop_rsp_permissions;
+    wire               l2_snoop_rsp_ready;
+
     rv64g_l2_cache #(
         .CORES    (L2_CORES),
         .WAYS     (L2_WAYS),
@@ -221,7 +231,17 @@ module tlc_l2_dma_shared_mem_top #(
         .mem_d_data_i  (l2_mem_d_data),
         .mem_d_corrupt_i(1'b0),
         .mem_d_valid_i (l2_mem_d_valid),
-        .mem_d_ready_o (l2_mem_d_ready)
+        .mem_d_ready_o (l2_mem_d_ready),
+
+        .snoop_req_valid_i      (l2_snoop_req_valid),
+        .snoop_req_addr_i       (l2_snoop_req_addr),
+        .snoop_req_permissions_i(l2_snoop_req_permissions),
+        .snoop_req_ready_o      (l2_snoop_req_ready),
+        .snoop_rsp_valid_o      (l2_snoop_rsp_valid),
+        .snoop_rsp_has_data_o   (l2_snoop_rsp_has_data),
+        .snoop_rsp_data_o       (l2_snoop_rsp_data),
+        .snoop_rsp_permissions_o(l2_snoop_rsp_permissions),
+        .snoop_rsp_ready_i      (l2_snoop_rsp_ready)
     );
 
     l2_tlc_bridge #(
@@ -241,6 +261,16 @@ module tlc_l2_dma_shared_mem_top #(
         .mem_d_data_o  (l2_mem_d_data),
         .mem_d_valid_o (l2_mem_d_valid),
         .mem_d_ready_i (l2_mem_d_ready),
+
+        .snoop_req_valid_o      (l2_snoop_req_valid),
+        .snoop_req_addr_o       (l2_snoop_req_addr),
+        .snoop_req_permissions_o(l2_snoop_req_permissions),
+        .snoop_req_ready_i      (l2_snoop_req_ready),
+        .snoop_rsp_valid_i      (l2_snoop_rsp_valid),
+        .snoop_rsp_has_data_i   (l2_snoop_rsp_has_data),
+        .snoop_rsp_data_i       (l2_snoop_rsp_data),
+        .snoop_rsp_permissions_i(l2_snoop_rsp_permissions),
+        .snoop_rsp_ready_o      (l2_snoop_rsp_ready),
 
         .l1_request_valid          (m0_req_valid),
         .l1_request_addr           (m0_req_addr),
